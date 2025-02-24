@@ -10,24 +10,27 @@ import (
 // Constants for timing configurations
 const (
 	KeepaliveInterval  = 100 * time.Millisecond // Interval between keepalive messages
-	ReadTimeoutFactor  = 1.5                    // Factor for read deadline (1.5× KeepaliveInterval)
-	ReadTimeout        = time.Duration(float64(KeepaliveInterval) * ReadTimeoutFactor)
-	TCPKeepAlivePeriod = 5 * time.Second // TCP Keep-Alive period
+	TCPKeepAlivePeriod = 5 * time.Second        // TCP Keep-Alive period
+	MinReadTimeout     = 150 * time.Millisecond // Minimum allowed read timeout (1.5×KeepaliveInterval)
+	MaxReadTimeout     = 3 * time.Second        // Maximum allowed read timeout
+	InitialRTT         = 100 * time.Millisecond // Initial RTT estimate
+	RTTSmoothingFactor = 0.5                    // Smoothing factor for RTT adjustment
 )
 
 // KeepaliveMessage is a single newline character
 var KeepaliveMessage = []byte("\n")
 
-// LastDisconnectTime stores the last disconnect timestamp for each client
+// LastDisconnectTime stores the last disconnect timestamp for each client (by IP)
 var (
-	LastDisconnectTime  = make(map[string]time.Time) // Now based only on IP, not port
-	lastDisconnectMutex sync.Mutex                   // Protects access to LastDisconnectTime
+	LastDisconnectTime  = make(map[string]time.Time)
+	lastDisconnectMutex sync.Mutex // Protects access to LastDisconnectTime
 )
 
 // HandleClient processes an incoming connection and periodically sends keepalive messages
 func HandleClient(conn net.Conn) {
-	clientAddr := conn.RemoteAddr().(*net.TCPAddr) // Get IP without port
-	clientIP := clientAddr.IP.String()             // Use only IP
+	// Get IP without port by IP
+	clientAddr := conn.RemoteAddr().(*net.TCPAddr)
+	clientIP := clientAddr.IP.String()
 
 	// Check if the client had a previous disconnection
 	lastDisconnectMutex.Lock()
@@ -77,6 +80,7 @@ func HandleClient(conn net.Conn) {
 func RunClient(serverAddr string) {
 	var lastDisconnect time.Time
 	connected := false
+	estimatedRTT := InitialRTT
 
 	for {
 		conn, err := net.Dial("tcp", serverAddr)
@@ -115,21 +119,26 @@ func RunClient(serverAddr string) {
 			}()
 
 			buf := make([]byte, 1)
-			lastReceived := time.Now()
-
 			for {
-				_ = conn.SetReadDeadline(time.Now().Add(ReadTimeout))
-				_, err := conn.Read(buf)
-
-				if err != nil {
-					// Check if the last received message was more than KeepaliveInterval ago
-					if time.Since(lastReceived) > KeepaliveInterval {
-						log.Printf("Connection with %s lost: %v", serverAddr, err)
-						break
-					}
-				} else {
-					lastReceived = time.Now() // Update last received timestamp
+				// Compute the adaptive timeout as estimatedRTT*2, bounded by MinReadTimeout and MaxReadTimeout
+				adaptiveTimeout := estimatedRTT * 2
+				if adaptiveTimeout < MinReadTimeout {
+					adaptiveTimeout = MinReadTimeout
 				}
+				if adaptiveTimeout > MaxReadTimeout {
+					adaptiveTimeout = MaxReadTimeout
+				}
+
+				_ = conn.SetReadDeadline(time.Now().Add(adaptiveTimeout))
+				start := time.Now()
+				_, err := conn.Read(buf)
+				if err != nil {
+					log.Printf("Connection with %s lost: %v", serverAddr, err)
+					break
+				}
+				// Measuring RTT by Read execution time
+				rtt := time.Since(start)
+				estimatedRTT = time.Duration(float64(estimatedRTT)*(1-RTTSmoothingFactor) + float64(rtt)*RTTSmoothingFactor)
 			}
 		}()
 	}
